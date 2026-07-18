@@ -305,7 +305,7 @@ function boot(){
       maxSpeed=0, speed=0, heading=0, ascent=0, lastAlt=null, rideStart=null;
   var last=null, watchId=null, wakeLock=null, track=[];
   var map=null, meMarker=null, line=null, followMap=true, resetArmed=null;
-  var memRides = null; // fallback se lo storage è bloccato
+    var navigationSteps=[], currentStep=0, navigationActive=false, routeLine=null, currentPosition=null;
 
   function $(id){ return document.getElementById(id); }
   var elSpeed=$("speed"), elTime=$("time"), elDist=$("dist"), elAvg=$("avg"),
@@ -459,7 +459,7 @@ function boot(){
   function onPos(pos){
     var c=pos.coords, now=pos.timestamp||Date.now();
     setGps(c.accuracy);
-    var here={lat:c.latitude, lon:c.longitude, t:now, acc:c.accuracy, alt:c.altitude};
+    var here={lat:c.latitude, lon:c.longitude, t:now, acc:c.accuracy, alt:c.altitude}; currentPosition = [here.lat, here.lon];
 
     if (map){
       meMarker.setLatLng([here.lat,here.lon]);
@@ -499,6 +499,7 @@ function boot(){
       }
     }
     last=here;
+    updateNavigation(currentPosition);
     render();
   }
 
@@ -781,6 +782,92 @@ function boot(){
     }
   }
 
+  /* ---------- navigazione bici OSRM ---------- */
+  function speakNav(t){
+    if ("speechSynthesis" in window){
+      window.speechSynthesis.cancel();
+      var u = new SpeechSynthesisUtterance(t);
+      u.lang = "it-IT";
+      window.speechSynthesis.speak(u);
+    }
+  }
+  function vibrateNav(t){
+    if (!navigator.vibrate) return;
+    if (t === "right") navigator.vibrate(400);
+    if (t === "left") navigator.vibrate([80,80,80]);
+    if (t === "wrong") navigator.vibrate([150,50,150,50,150]);
+    if (t === "near") navigator.vibrate(250);
+  }
+  function hav(a,b){
+    var R=6371000, toRad=Math.PI/180;
+    var p=a[0]*toRad, q=b[0]*toRad, dp=(b[0]-a[0])*toRad, dl=(b[1]-a[1])*toRad;
+    var x=Math.sin(dp/2)*Math.sin(dp/2)+Math.cos(p)*Math.cos(q)*Math.sin(dl/2)*Math.sin(dl/2);
+    return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
+  }
+  function navText(step){
+    return (step.text || "prosegui").replace(/_/g," ");
+  }
+  window.calculateBikeRoute = function(){
+    var input = $("destinationInput");
+    var q = input ? input.value.replace(/^\s+|\s+$/g,"") : "";
+    if (!q) return;
+    if (!map){ msg("Mappa non disponibile: impossibile avviare la navigazione."); return; }
+    if (!currentPosition){ msg("Aspetta il primo segnale GPS prima di navigare."); return; }
+    if (typeof fetch === "undefined"){ msg("Navigazione non disponibile in questo browser."); return; }
+    msg("Calcolo percorso in bici\u2026");
+    fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="+encodeURIComponent(q))
+      .then(function(r){ return r.json(); })
+      .then(function(g){
+        if (!g || !g.length) throw new Error("not-found");
+        var d=[parseFloat(g[0].lat), parseFloat(g[0].lon)], s=currentPosition;
+        var url="https://router.project-osrm.org/route/v1/bike/"+
+                s[1]+","+s[0]+";"+d[1]+","+d[0]+"?steps=true&overview=full&geometries=geojson";
+        return fetch(url).then(function(r){ return r.json(); });
+      })
+      .then(function(data){
+        if (!data || data.code !== "Ok" || !data.routes || !data.routes.length) throw new Error("route");
+        var r=data.routes[0], coords=r.geometry.coordinates.map(function(c){ return [c[1],c[0]]; });
+        var steps=[];
+        r.legs[0].steps.forEach(function(x){
+          var m=x.maneuver || {}, mod=m.modifier || "", a="\u2191";
+          if (mod.indexOf("left")>=0) a="\u2196";
+          if (mod.indexOf("right")>=0) a="\u2197";
+          if (m.type === "roundabout") a="\u27f3";
+          if (m.type === "uturn") a="\u21a9";
+          steps.push({distance:x.distance,arrow:a,text:(m.type||"")+" "+mod,location:[m.location[1],m.location[0]],announced:false});
+        });
+        startNavigation(coords, steps);
+        msg("");
+      })["catch"](function(e){
+        msg(e && e.message === "not-found" ? "Destinazione non trovata." : "Impossibile calcolare il percorso. Controlla la connessione.");
+      });
+  };
+  function startNavigation(route,steps){
+    navigationActive=true; navigationSteps=steps; currentStep=0;
+    if (routeLine) map.removeLayer(routeLine);
+    routeLine = L.polyline(route,{color:"#111",weight:5,opacity:.85}).addTo(map);
+    var navBox=$("navBox"); if (navBox) navBox.style.display="block";
+    speakNav("Navigazione iniziata");
+  }
+  function updateNavigation(pos){
+    if (!navigationActive || !navigationSteps.length) return;
+    var s=navigationSteps[currentStep];
+    if (!s){ navigationActive=false; return; }
+    var d=hav(pos,s.location), arrow=$("navArrow"), dist=$("navDistance"), prog=$("navProgress");
+    if (arrow) arrow.innerHTML=s.arrow;
+    if (dist) dist.innerHTML=Math.round(d)+" m<br>"+navText(s);
+    if (prog) prog.innerHTML=(currentStep+1)+"/"+navigationSteps.length;
+    if (d<100 && !s.announced){ speakNav("Tra "+Math.round(d)+" metri "+navText(s)); vibrateNav("near"); s.announced=true; }
+    if (d<20){
+      if (s.arrow === "\u2197") vibrateNav("right");
+      if (s.arrow === "\u2196") vibrateNav("left");
+      currentStep++;
+      if (currentStep>=navigationSteps.length){ navigationActive=false; speakNav("Destinazione raggiunta"); }
+    }
+  }
+
+
+
   /* ---------- avvio ---------- */
   setInterval(function(){
     if (running) render();
@@ -794,24 +881,5 @@ function boot(){
     ? "Aperta da file locale: il GPS resta spento. Serve un indirizzo https:// (o localhost)."
     : "Tocca Avvia per iniziare a registrare.");
 }
-</script>
-
-<!-- V2 OSRM bike navigation -->
-<div id="navBox" style="display:none;position:fixed;top:10px;left:10px;right:10px;z-index:9999;background:#111;color:white;border-radius:14px;padding:12px;text-align:center;font-size:22px">
-<div id="navArrow">↑</div><div id="navDistance"></div><div id="navProgress"></div>
-</div>
-<div id="destinationBox" style="position:fixed;bottom:10px;left:10px;right:10px;z-index:9998;background:white;padding:8px;border-radius:12px">
-<input id="destinationInput" placeholder="Destinazione" style="width:70%;padding:8px"><button onclick="calculateBikeRoute()">Naviga</button>
-</div>
-<script>
-let navigationSteps=[],currentStep=0,navigationActive=false,navigationCoords=[],routeLine=null,navigationTotal=0;
-function speakNav(t){if('speechSynthesis' in window){speechSynthesis.cancel();let u=new SpeechSynthesisUtterance(t);u.lang='it-IT';speechSynthesis.speak(u)}}
-function vibrateNav(t){if(!navigator.vibrate)return;if(t==='right')navigator.vibrate(400);if(t==='left')navigator.vibrate([80,80,80]);if(t==='wrong')navigator.vibrate([150,50,150,50,150]);if(t==='near')navigator.vibrate(250)}
-function hav(a,b){let R=6371000,p=a[0]*Math.PI/180,q=b[0]*Math.PI/180,dp=(b[0]-a[0])*Math.PI/180,dl=(b[1]-a[1])*Math.PI/180,x=Math.sin(dp/2)**2+Math.cos(p)*Math.cos(q)*Math.sin(dl/2)**2;return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x))}
-async function calculateBikeRoute(){let q=document.getElementById('destinationInput').value;if(!q)return;if(!window.currentPosition){alert('Aspetta GPS');return}let g=await fetch('https://nominatim.openstreetmap.org/search?format=json&q='+encodeURIComponent(q)).then(r=>r.json());if(!g.length)return alert('Destinazione non trovata');let d=[+g[0].lat,+g[0].lon],s=window.currentPosition;let url=`https://router.project-osrm.org/route/v1/cycling/${s[1]},${s[0]};${d[1]},${d[0]}?steps=true&overview=full&geometries=geojson`;let data=await fetch(url).then(r=>r.json());let r=data.routes[0];navigationTotal=r.distance;navigationCoords=r.geometry.coordinates.map(c=>[c[1],c[0]]);navigationSteps=[];r.legs[0].steps.forEach(x=>{let m=x.maneuver,mod=m.modifier||'',a='↑';if(mod.includes('left'))a='↖';if(mod.includes('right'))a='↗';if(m.type==='roundabout')a='⟳';if(m.type==='uturn')a='↩';navigationSteps.push({distance:x.distance,arrow:a,text:m.type+' '+mod,location:[m.location[1],m.location[0]]})});startNavigation(navigationCoords,navigationSteps)}
-function startNavigation(route,steps){navigationActive=true;navigationSteps=steps;currentStep=0;if(routeLine)map.removeLayer(routeLine);routeLine=L.polyline(route,{weight:5}).addTo(map);document.getElementById('navBox').style.display='block';speakNav('Navigazione iniziata')}
-function updateNavigation(pos){if(!navigationActive||!navigationSteps.length)return;let s=navigationSteps[currentStep],d=hav(pos,s.location);navArrow.innerHTML=s.arrow;navDistance.innerHTML=Math.round(d)+' m<br>'+s.text;if(d<100)speakNav('Tra '+Math.round(d)+' metri '+s.text),vibrateNav('near');if(d<20){if(s.arrow==='↗')vibrateNav('right');if(s.arrow==='↖')vibrateNav('left');currentStep++;if(currentStep>=navigationSteps.length){navigationActive=false;speakNav('Destinazione raggiunta')}}}
-let old=window.onPos;window.onPos=function(p){window.currentPosition=[p.coords.latitude,p.coords.longitude];if(old)old(p);updateNavigation(window.currentPosition)};
-</script>
 </body>
 </html>
